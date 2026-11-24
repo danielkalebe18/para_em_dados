@@ -1,12 +1,17 @@
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 import folium
 import geopandas as gpd
 import pandas as pd
 import branca.colormap as cm
+import unicodedata
+import re
 
 app = Flask(__name__)
 
-# Arquivos dos dados
+# ==========================================
+# ARQUIVOS DOS DADOS
+# ==========================================
+
 ARQUIVO_MAPA = "data/parauapebas_setores.gpkg"
 ARQUIVO_POPULACAO = "data/parauapebas_populacao.csv"
 ARQUIVO_PARA = "data_para/para_setores_populacao.gpkg"
@@ -108,6 +113,8 @@ HTML = """
             padding: 13px 22px;
             border-radius: 5px;
             margin: 7px;
+            border: none;
+            cursor: pointer;
         }
 
         .botao:hover {
@@ -142,13 +149,50 @@ HTML = """
 
         .mapa-container {
             width: 100%;
-            height: calc(100vh - 160px);
+            height: calc(100vh - 290px);
+            min-height: 450px;
         }
 
         .mapa-container iframe {
             width: 100%;
             height: 100%;
             border: none;
+        }
+
+        .pesquisa {
+            background: white;
+            padding: 18px;
+            margin: 15px;
+            border-radius: 8px;
+            border: 1px solid #cbd5e1;
+        }
+
+        .campo-pesquisa {
+            width: 100%;
+            max-width: 500px;
+            padding: 12px;
+            border: 1px solid #9caec2;
+            border-radius: 5px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+
+        .opcoes {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-top: 18px;
+        }
+
+        .opcoes label {
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .mensagem {
+            color: #17365d;
+            font-size: 14px;
+            margin-top: 12px;
         }
 
         @media (max-width: 600px) {
@@ -159,6 +203,10 @@ HTML = """
 
             .card h2 {
                 font-size: 26px;
+            }
+
+            .mapa-container {
+                height: 65vh;
             }
         }
     </style>
@@ -188,10 +236,23 @@ HTML = """
 
 
 def mostrar_pagina(conteudo):
-    return render_template_string(
-        HTML,
-        conteudo=conteudo
+    return render_template_string(HTML, conteudo=conteudo)
+
+
+# ==========================================
+# FUNÇÃO DE NORMALIZAÇÃO DE NOMES
+# ==========================================
+
+def normalizar_nome(nome):
+    nome = str(nome).strip().lower()
+    nome = unicodedata.normalize("NFKD", nome)
+
+    nome = "".join(
+        caractere for caractere in nome
+        if not unicodedata.combining(caractere)
     )
+
+    return re.sub(r"\s+", " ", nome)
 
 
 # ==========================================
@@ -307,8 +368,8 @@ def escolher_mapa():
 
             <div class="card">
                 <h3>Pará inteiro</h3>
-                <p>Visualização dos setores censitários
-                de todo o estado.</p>
+                <p>Pesquise qualquer município ou visualize
+                os setores censitários de todo o estado.</p>
 
                 <a class="botao" href="/para">
                     Abrir mapa
@@ -329,7 +390,7 @@ def escolher_mapa():
 
 def criar_mapa(setores, titulo, localizacao, zoom):
 
-    setores = setores.to_crs(epsg=4326)
+    setores = setores.to_crs(epsg=4326).copy()
 
     setores["v0001"] = pd.to_numeric(
         setores["v0001"],
@@ -339,29 +400,159 @@ def criar_mapa(setores, titulo, localizacao, zoom):
     mapa = folium.Map(
         location=localizacao,
         zoom_start=zoom,
-        tiles="OpenStreetMap",
+        tiles=None,
         control_scale=True
     )
 
+    folium.TileLayer(
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
+        attr="Tiles ©️ Esri",
+        name="Imagem de satélite",
+        overlay=False,
+        control=True,
+        max_zoom=19
+    ).add_to(mapa)
+
+    valores = setores["v0001"].dropna()
+
+    if not valores.empty:
+
+        minimo = valores.min()
+        maximo = valores.max()
+
+        if minimo == maximo:
+            maximo = minimo + 1
+
+        escala = cm.LinearColormap(
+            colors=["#ffffcc", "#fd8d3c", "#bd0026"],
+            vmin=minimo,
+            vmax=maximo,
+            caption="População por setor censitário"
+        )
+
+        def estilo(feature):
+            valor = feature["properties"].get("v0001")
+
+            try:
+                valor = float(valor)
+                cor = escala(valor)
+            except (TypeError, ValueError):
+                cor = "#cccccc"
+
+            return {
+                "fillColor": cor,
+                "color": "#333333",
+                "weight": 0.5,
+                "fillOpacity": 0.65
+            }
+
+        campos = [
+            campo for campo in ["CD_SETOR", "NM_MUN", "v0001"]
+            if campo in setores.columns
+        ]
+
+        aliases = {
+            "CD_SETOR": "Código do setor:",
+            "NM_MUN": "Município:",
+            "v0001": "Total de pessoas:"
+        }
+
+        folium.GeoJson(
+            data=setores.to_json(),
+            name="População por setor",
+            style_function=estilo,
+
+            highlight_function=lambda feature: {
+                "weight": 2,
+                "color": "#000000",
+                "fillOpacity": 0.85
+            },
+
+            tooltip=folium.GeoJsonTooltip(
+                fields=campos,
+                aliases=[aliases[campo] for campo in campos],
+                localize=True
+            )
+
+        ).add_to(mapa)
+
+        escala.add_to(mapa)
+
+    return mapa
+
+
+# ==========================================
+# FUNÇÃO PARA ADICIONAR SETORES DIRETAMENTE
+# AO MAPA DO PARÁ
+# ==========================================
+
+def adicionar_setores(mapa, setores, nome_camada):
+
+    setores = setores.to_crs(epsg=4326).copy()
+
+    setores["v0001"] = pd.to_numeric(
+        setores["v0001"],
+        errors="coerce"
+    )
+
+    grupo = folium.FeatureGroup(
+        name=nome_camada,
+        show=True
+    )
+
+    valores = setores["v0001"].dropna()
+
+    if valores.empty:
+        return
+
+    minimo = valores.min()
+    maximo = valores.max()
+
+    if minimo == maximo:
+        maximo = minimo + 1
+
     escala = cm.LinearColormap(
         colors=["#ffffcc", "#fd8d3c", "#bd0026"],
-        vmin=setores["v0001"].min(),
-        vmax=setores["v0001"].max(),
+        vmin=minimo,
+        vmax=maximo,
         caption="População por setor censitário"
     )
 
-    folium.GeoJson(
-        data=setores.to_json(),
-        name="População por setor",
+    def estilo(feature):
 
-        style_function=lambda feature: {
-            "fillColor": escala(
-                feature["properties"]["v0001"]
-            ),
+        valor = feature["properties"].get("v0001")
+
+        try:
+            valor = float(valor)
+            cor = escala(valor)
+        except (TypeError, ValueError):
+            cor = "#cccccc"
+
+        return {
+            "fillColor": cor,
             "color": "#333333",
             "weight": 0.5,
             "fillOpacity": 0.65
-        },
+        }
+
+    campos = [
+        campo for campo in ["CD_SETOR", "NM_MUN", "v0001"]
+        if campo in setores.columns
+    ]
+
+    aliases = {
+        "CD_SETOR": "Código do setor:",
+        "NM_MUN": "Município:",
+        "v0001": "Total de pessoas:"
+    }
+
+    folium.GeoJson(
+        data=setores.to_json(),
+        name=nome_camada,
+        style_function=estilo,
 
         highlight_function=lambda feature: {
             "weight": 2,
@@ -370,29 +561,15 @@ def criar_mapa(setores, titulo, localizacao, zoom):
         },
 
         tooltip=folium.GeoJsonTooltip(
-            fields=["CD_SETOR", "NM_MUN", "v0001"],
-            aliases=[
-                "Código do setor:",
-                "Município:",
-                "Total de pessoas:"
-            ],
+            fields=campos,
+            aliases=[aliases[campo] for campo in campos],
             localize=True
         )
 
-    ).add_to(mapa)
+    ).add_to(grupo)
 
+    grupo.add_to(mapa)
     escala.add_to(mapa)
-
-    minx, miny, maxx, maxy = setores.total_bounds
-
-    mapa.fit_bounds([
-        [miny, minx],
-        [maxy, maxx]
-    ])
-
-    folium.LayerControl().add_to(mapa)
-
-    return mapa
 
 
 # ==========================================
@@ -450,34 +627,275 @@ def parauapebas():
 
 
 # ==========================================
-# MAPA DE TODO O PARÁ
+# MAPA DE TODO O PARÁ COM PESQUISA
 # ==========================================
 
 @app.route("/para")
 def mapa_para():
 
+    # Carregar os setores do Pará
     setores = gpd.read_file(ARQUIVO_PARA)
 
-    mapa = criar_mapa(
-        setores,
-        "Pará",
-        [-3.8, -52.5],
-        6
+    # Transformar as coordenadas para latitude e longitude
+    setores = setores.to_crs(epsg=4326)
+
+    setores["v0001"] = pd.to_numeric(
+        setores["v0001"],
+        errors="coerce"
     )
 
+    # Lista de municípios disponíveis
+    municipios = sorted(
+        setores["NM_MUN"].dropna().astype(str).unique().tolist()
+    )
+
+    # Município pesquisado
+    municipio = request.args.get("municipio", "").strip()
+
+    mostrar_municipio = (
+        request.args.get("mostrar_municipio") == "1"
+    )
+
+    mostrar_para = (
+        request.args.get("mostrar_para") == "1"
+    )
+
+    # ======================================
+    # ENCONTRAR MUNICÍPIO
+    # ======================================
+
+    setores_municipio = None
+    municipio_encontrado = None
+
+    if municipio:
+
+        municipio_normalizado = normalizar_nome(municipio)
+
+        nomes_normalizados = setores["NM_MUN"].fillna("").map(
+            normalizar_nome
+        )
+
+        filtro = nomes_normalizados == municipio_normalizado
+
+        if filtro.any():
+
+            setores_municipio = setores.loc[filtro].copy()
+
+            municipio_encontrado = setores_municipio[
+                "NM_MUN"
+            ].iloc[0]
+
+    # ======================================
+    # CRIAR MAPA PRINCIPAL
+    # ======================================
+
+    mapa = folium.Map(
+        location=[-3.8, -52.5],
+        zoom_start=6,
+        tiles=None,
+        control_scale=True
+    )
+
+    # Fundo de satélite
+    folium.TileLayer(
+        tiles=(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
+        attr="Tiles ©️ Esri",
+        name="Imagem de satélite",
+        overlay=False,
+        control=True,
+        max_zoom=19
+    ).add_to(mapa)
+
+    # ======================================
+    # MOSTRAR CONTORNO DO MUNICÍPIO
+    # ======================================
+
+    if setores_municipio is not None:
+
+        limite_municipio = setores_municipio[
+            ["geometry"]
+        ].dissolve()
+
+        folium.GeoJson(
+            data=limite_municipio.to_json(),
+            name="Limite do município",
+
+            style_function=lambda feature: {
+                "fillColor": "#00ffff",
+                "color": "#00ffff",
+                "weight": 3,
+                "fillOpacity": 0.08
+            },
+
+            tooltip=municipio_encontrado
+
+        ).add_to(mapa)
+
+    # ======================================
+    # MOSTRAR SETORES DO MUNICÍPIO
+    # ======================================
+
+    if mostrar_municipio and setores_municipio is not None:
+
+        adicionar_setores(
+            mapa,
+            setores_municipio,
+            "Setores censitários do município"
+        )
+
+    # ======================================
+    # MOSTRAR SETORES DO PARÁ INTEIRO
+    # ======================================
+
+    if mostrar_para:
+
+        adicionar_setores(
+            mapa,
+            setores,
+            "Setores censitários do Pará inteiro"
+        )
+
+    # ======================================
+    # APROXIMAR AUTOMATICAMENTE O MUNICÍPIO
+    # ======================================
+
+    if setores_municipio is not None:
+
+        # Garantir que os limites estejam em EPSG:4326
+        setores_zoom = setores_municipio.to_crs(epsg=4326)
+
+        minx, miny, maxx, maxy = setores_zoom.total_bounds
+
+        mapa.fit_bounds(
+            [
+                [miny, minx],
+                [maxy, maxx]
+            ],
+            padding=(10, 10),
+            max_zoom=16
+        )
+
+    # ======================================
+    # VISÃO GERAL DO PARÁ
+    # ======================================
+
+    elif mostrar_para or not municipio:
+
+        minx, miny, maxx, maxy = setores.total_bounds
+
+        mapa.fit_bounds(
+            [
+                [miny, minx],
+                [maxy, maxx]
+            ],
+            padding=(20, 20)
+        )
+
+    # Controle das camadas
+    folium.LayerControl(collapsed=False).add_to(mapa)
+
+    # ======================================
+    # INTERFACE DE PESQUISA
+    # ======================================
+
     conteudo = """
+    <div class="pesquisa">
+
+        <h2>Pesquisar município do Pará</h2>
+
+        <form method="GET" action="/para">
+
+            <input
+                class="campo-pesquisa"
+                type="text"
+                name="municipio"
+                list="lista-municipios"
+                placeholder="Digite o nome da cidade..."
+                value="{{ municipio }}"
+                autocomplete="off"
+            >
+
+            <datalist id="lista-municipios">
+                {% for nome in municipios %}
+                    <option value="{{ nome }}"></option>
+                {% endfor %}
+            </datalist>
+
+            <button class="botao" type="submit">
+                Pesquisar
+            </button>
+
+            <a class="botao secundario" href="/para">
+                Limpar
+            </a>
+
+            <div class="opcoes">
+
+                <label>
+                    <input
+                        type="checkbox"
+                        name="mostrar_municipio"
+                        value="1"
+                        {% if mostrar_municipio %}checked{% endif %}
+                        onchange="this.form.submit()"
+                    >
+                    Mostrar setores do município
+                </label>
+
+                <label>
+                    <input
+                        type="checkbox"
+                        name="mostrar_para"
+                        value="1"
+                        {% if mostrar_para %}checked{% endif %}
+                        onchange="this.form.submit()"
+                    >
+                    Mostrar setores do Pará inteiro
+                </label>
+
+            </div>
+
+        </form>
+
+        {% if municipio_encontrado %}
+            <p class="mensagem">
+                Município selecionado:
+                <strong>{{ municipio_encontrado }}</strong>
+            </p>
+
+        {% elif municipio %}
+            <p class="mensagem">
+                Município não encontrado. Confira o nome digitado.
+            </p>
+
+        {% else %}
+            <p class="mensagem">
+                Pesquise uma cidade ou escolha uma das camadas
+                para visualizar os setores.
+            </p>
+        {% endif %}
+
+    </div>
+
     <div class="mapa-container">
         {{ mapa_html|safe }}
     </div>
     """
 
-    return render_template_string(
-        HTML,
-        conteudo=render_template_string(
-            conteudo,
-            mapa_html=mapa._repr_html_()
-        )
+    conteudo_renderizado = render_template_string(
+        conteudo,
+        mapa_html=mapa._repr_html_(),
+        municipios=municipios,
+        municipio=municipio,
+        municipio_encontrado=municipio_encontrado,
+        mostrar_municipio=mostrar_municipio,
+        mostrar_para=mostrar_para
     )
+
+    return mostrar_pagina(conteudo_renderizado)
 
 
 # ==========================================
